@@ -1,172 +1,233 @@
-import os
-import json
-from typing import Dict, Any, List, Optional
-from datetime import datetime
-import uuid
+from typing import TypedDict, Annotated, List, Dict, Any, Optional, Literal
 
-from langchain_core.messages import BaseMessage
-from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, config
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents import create_agent
+from langgraph.prebuilt import tools_condition, ToolNode
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+import re
+import operator
+from schemas import (
+    UserIntent, SessionState,
+    AnswerResponse, SummarizationResponse, CalculationResponse, UpdateMemoryResponse
+)
+from prompts import get_intent_classification_prompt, get_chat_prompt_template, MEMORY_SUMMARY_PROMPT
 
-from schemas import SessionState
-from retrieval import SimulatedRetriever
-from tools import get_all_tools, ToolLogger
-from agent import create_workflow, AgentState
-from prompts import MEMORY_SUMMARY_PROMPT
 
-
-class DocumentAssistant:
+class AgentState(TypedDict):
     """
-    The assistant creates and loads sessions and
-    stores state/session data within a file.
+    The agent state object
+    """
+    # Current conversation
+    user_input: Optional[str]
+    messages: Annotated[List[BaseMessage], add_messages]
+
+    # Intent and routing
+    intent: Optional[UserIntent]
+    next_step: str
+
+    # Memory and context
+    conversation_summary: str
+    active_documents: Optional[List[str]]
+
+    # Current task state
+    current_response: Optional[Dict[str, Any]]
+    tools_used: List[str]
+
+    # Session management
+    session_id: Optional[str]
+    user_id: Optional[str]
+
+    actions_taken: List[str]
+    action_history: Annotated[List[str], operator.add]
+
+def invoke_react_agent(response_schema: type[BaseModel], messages: List[BaseMessage], llm, tools) -> (Dict[str, Any], List[str]):
+    llm_with_tools = llm.bind_tools(
+        tools
+    )
+
+    agent = create_agent(
+        model=llm_with_tools,  # Use the bound model
+        tools=tools,
+        response_format=response_schema,
+    )
+
+    result = agent.invoke({"messages": messages})
+    tools_used = [t.name for t in result.get("messages", []) if isinstance(t, ToolMessage)]
+
+    return result, tools_used
+
+def classify_intent(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Classify user intent and update next_step. Also records that this
+    function executed by appending "classify_intent" to actions_taken.
     """
 
-    def __init__(
-            self,
-            openai_api_key: str,
-            model_name: str = "gpt-4o",
-            temperature: float = 0.1,
-            session_storage_path: str = "./sessions"
-    ):
-        # Initialize LLM
-        self.llm = ChatOpenAI(
-            api_key=openai_api_key,
-            model=model_name,
-            temperature=temperature,
-            base_url="https://openai.vocareum.com/v1"
-        )
+    llm = config.get("configurable").get("llm")
+    history = state.get("messages", [])
 
-        # Initialize components
-        self.retriever = SimulatedRetriever()
-        self.tool_logger = ToolLogger(logs_dir="./logs")
-        self.tools = get_all_tools(self.retriever, self.tool_logger)
+    llm = llm.with_structured_output(UserIntent)
 
-        # Create workflow (compiled with checkpointer inside create_workflow)
-        self.workflow = create_workflow(self.llm, self.tools)
+    prompt = get_intent_classification_prompt().format(
+        user_input=state.get("user_input"),
+        conversation_history=history,
+    )
 
-        # Session management
-        self.session_storage_path = session_storage_path
-        os.makedirs(session_storage_path, exist_ok=True)
+    intent = llm.invoke(prompt)
 
-        # Current session
-        self.current_session: Optional[SessionState] = None
+    if intent.intent_type == "qa":
+        next_step = "qa_agent"
+    elif intent.intent_type == "summarization":
+        next_step = "summarization_agent"
+    elif intent.intent_type == "calculation":
+        next_step = "calculation_agent"
+    else:
+        next_step = "qa_agent"
 
-    def start_session(self, user_id: str, session_id: Optional[str] = None) -> str:
-        """Start a new session or resume an existing one."""
-        if session_id and self._session_exists(session_id):
-            # Load existing session
-            self.current_session = self._load_session(session_id)
-            print(f"Resumed session {session_id}")
-        else:
-            # Create new session
-            session_id = session_id or str(uuid.uuid4())
-            self.current_session = SessionState(
-                session_id=session_id,
-                user_id=user_id,
-                conversation_history=[],
-                document_context=[]
-            )
-            print(f"Started new session {session_id}")
-        return session_id
+    return {
+        "actions_taken": ["classify_intent"],
+        "action_history": ["classify_intent"],
+        "intent": intent,
+        "next_step": next_step,
+    }
 
-    def _session_exists(self, session_id: str) -> bool:
-        filepath = os.path.join(self.session_storage_path, f"{session_id}.json")
-        return os.path.exists(filepath)
+def qa_agent(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Handle Q&A tasks and record the action.
+    """
+    llm = config.get("configurable").get("llm")
+    tools = config.get("configurable").get("tools")
 
-    def _load_session(self, session_id: str) -> SessionState:
-        filepath = os.path.join(self.session_storage_path, f"{session_id}.json")
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        return SessionState(**data)
+    prompt_template = get_chat_prompt_template("qa")
 
-    def _save_session(self) -> None:
-        if self.current_session:
-            filepath = os.path.join(
-                self.session_storage_path,
-                f"{self.current_session.session_id}.json"
-            )
-            session_dict = self.current_session.dict()
+    messages = prompt_template.invoke({
+        "input": state["user_input"],
+        "chat_history": state.get("messages", []),
+    }).to_messages()
 
-            def serialize_datetime(obj):
-                if isinstance(obj, datetime):
-                    return obj.isoformat()
-                return obj
+    result, tools_used = invoke_react_agent(AnswerResponse, messages, llm, tools)
 
-            with open(filepath, 'w') as f:
-                json.dump(session_dict, f, indent=2, default=serialize_datetime)
+    return {
+        "messages": result.get("messages", []),
+        "actions_taken": state.get("actions_taken", []) + ["qa_agent"],
+        "action_history": ["qa_agent"],
+        "current_response": result,
+        "tools_used": tools_used,
+        "next_step": "update_memory",
+    }
 
-    def _get_conversation_summary(self, config) -> str:
-        if not self.current_session or not self.current_session.conversation_history:
-            return "No previous conversation."
+def summarization_agent(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Handle summarization tasks and record the action.
+    """
+    llm = config.get("configurable").get("llm")
+    tools = config.get("configurable").get("tools")
 
-        current_state = self.workflow.get_state(config).values
+    prompt_template = get_chat_prompt_template("summarization")
 
-        summary = current_state.get("conversation_summary", [])
-        return summary
+    messages = prompt_template.invoke({
+        "input": state["user_input"],
+        "chat_history": state.get("messages", []),
+    }).to_messages()
 
-    def _get_conversation_history(self, config) -> List[BaseMessage]:
-        if not self.current_session or not self.current_session.conversation_history:
-            return []
+    result, tools_used = invoke_react_agent(SummarizationResponse, messages, llm, tools)
 
-        current_state = self.workflow.get_state(config).values
+    return {
+        "messages": result.get("messages", []),
+        "actions_taken": state.get("actions_taken", []) + ["summarization_agent"],
+        "action_history": ["summarization_agent"],
+        "current_response": result,
+        "tools_used": tools_used,
+        "next_step": "update_memory",
+    }
 
-        history = current_state.get("messages", [])
-        return history
+def calculation_agent(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Handle calculation tasks and record the action.
+    """
+    llm = config.get("configurable").get("llm")
+    tools = config.get("configurable").get("tools")
 
+    prompt_template = get_chat_prompt_template("calculation")
 
-    def process_message(self, user_input: str) -> Dict[str, Any]:
-        """Process a user message using the LangGraph workflow."""
-        if not self.current_session:
-            raise ValueError("No active session. Call start_session() first.")
-            
-        config = {
-            "configurable": {
-                "thread_id": self.current_session.session_id,
-                "llm": self.llm,
-                "tools": self.tools
-            }
+    messages = prompt_template.invoke({
+        "input": state["user_input"],
+        "chat_history": state.get("messages", []),
+    }).to_messages()
+
+    result, tools_used = invoke_react_agent(CalculationResponse, messages, llm, tools)
+
+    return {
+        "messages": result.get("messages", []),
+        "actions_taken": state.get("actions_taken", []) + ["calculation_agent"],
+        "action_history": ["calculation_agent"],
+        "current_response": result,
+        "tools_used": tools_used,
+        "next_step": "update_memory",
+    }
+
+def update_memory(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Update conversation memory and record the action.
+    """
+    llm = config.get("configurable").get("llm")
+
+    prompt_with_history = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(MEMORY_SUMMARY_PROMPT),
+        MessagesPlaceholder("chat_history"),
+    ]).invoke({
+        "chat_history": state.get("messages", []),
+    })
+
+    structured_llm = llm.with_structured_output(UpdateMemoryResponse)
+
+    response = structured_llm.invoke(prompt_with_history)
+    return {
+        "conversation_summary": response.summary,
+        "active_documents": response.document_ids,
+        "actions_taken": state.get("actions_taken", []) + ["update_memory"],
+        "action_history": ["update_memory"],
+        "next_step": "end"
+    }
+
+def should_continue(state: AgentState) -> str:
+    """Router function"""
+    return state.get("next_step", "end")
+
+def create_workflow(llm, tools):
+    """
+    Creates the LangGraph agents.
+    Compiles the workflow with an InMemorySaver checkpointer to persist state.
+    """
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("classify_intent", classify_intent)
+    workflow.add_node("qa_agent", qa_agent)
+    workflow.add_node("summarization_agent", summarization_agent)
+    workflow.add_node("calculation_agent", calculation_agent)
+    workflow.add_node("update_memory", update_memory)
+
+    workflow.set_entry_point("classify_intent")
+    workflow.add_conditional_edges(
+        "classify_intent",
+        should_continue,
+        {
+            "qa_agent": "qa_agent",
+            "summarization_agent": "summarization_agent",
+            "calculation_agent": "calculation_agent",
+            "end": END
         }
-       
-        initial_state: AgentState = {
-            "messages": [],
-            "user_input": user_input,
-            "intent": None,
-            "next_step": "classify_intent",
-            "conversation_history": self.current_session.conversation_history,
-            "conversation_summary": self._get_conversation_summary(config),
-            "active_documents": self.current_session.document_context,
-            "current_response": None,
-            "tools_used": [],
-            "session_id": self.current_session.session_id,
-            "user_id": self.current_session.user_id,
-            # Initialise actions_taken list for this turn
-            "actions_taken": []
-        }
-        try:
-            # Invoke the workflow with a thread_id equal to the session_id
-            final_state = self.workflow.invoke(initial_state, config=config)
-            # Update session with new state
-            if final_state.get("messages"):
+    )
 
-                self.current_session.conversation_history.append(final_state)
-                self.current_session.last_updated = datetime.now()
-                if final_state.get("active_documents"):
-                    self.current_session.document_context = list(set(
-                        self.current_session.document_context +
-                        final_state["active_documents"]
-                    ))
-                self._save_session()
-            return {
-                "success": True,
-                "response": final_state.get("messages")[-1].content if final_state.get("messages") else None,
-                "intent": final_state.get("intent").dict() if final_state.get("intent") else None,
-                "tools_used": final_state.get("tools_used", []),
-                "sources": final_state.get("active_documents", []),
-                "actions_taken": final_state.get("actions_taken", []),
-                "summary": final_state.get("conversation_summary", [])
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "response": None
-            }
+    workflow.add_edge("qa_agent", "update_memory")
+    workflow.add_edge("summarization_agent", "update_memory")
+    workflow.add_edge("calculation_agent", "update_memory")
+
+    workflow.add_edge("update_memory", END)
+
+    memory_saver = InMemorySaver()  # Create an instance of InMemorySaver
+    return workflow.compile(checkpointer=memory_saver)  # Return the compiled workflow with checkpointer
