@@ -56,7 +56,12 @@ def invoke_react_agent(response_schema: type[BaseModel], messages: List[BaseMess
     )
 
     result = agent.invoke({"messages": messages})
-    tools_used = [t.name for t in result.get("messages", []) if isinstance(t, ToolMessage)]
+    # `messages` seeds the agent with prior chat_history, and agent.invoke() returns
+    # that full prefix plus what it generated. Slice it off so tools_used/messages
+    # reflect only this invocation, not tool calls replayed from earlier turns.
+    new_messages = result.get("messages", [])[len(messages):]
+    tools_used = [m.name for m in new_messages if isinstance(m, ToolMessage)]
+    result["messages"] = new_messages
 
     return result, tools_used
 

@@ -16,10 +16,29 @@ def get_intent_classification_prompt() -> PromptTemplate:
         template="""You are an intent classifier for a document processing assistant.
 
 Given the user input and conversation history, classify the user's intent into one of these categories:
-- qa: Questions about documents or records that do not require calculations.
+- qa: Questions about documents or records that can be answered by looking up a fact or value that is already stated directly in a document, with no arithmetic required.
 - summarization: Requests to summarize or extract key points from documents that do not require calculations.
-- calculation: Mathematical operations or numerical computations. Or questions about documents that may require calculations
+- calculation: Requests that require performing arithmetic (e.g. sums, differences, percentages, comparisons) on numbers found in one or more documents, even if the request is phrased as a question about a document.
 - unknown: Cannot determine the intent clearly
+
+Important distinction for qa vs. calculation: if the exact value the user asks for is already stated verbatim in a document (e.g. a line labeled "Total Due"), classify it as qa even if the word "total" or "calculate" appears. Only classify as calculation when answering requires combining, comparing, or otherwise computing numbers rather than simply reading one off the page.
+
+Examples:
+1. User Input: "What is the total amount due on invoice INV-002?"
+   Intent: qa
+   Reasoning: The total is already stated directly in the document; answering only requires looking it up, not computing it.
+
+2. User Input: "What is the combined total of invoices INV-001 and INV-002?"
+   Intent: calculation
+   Reasoning: Answering requires adding two separately stated totals together, which is arithmetic.
+
+3. User Input: "Summarize the key terms of the service agreement CON-001."
+   Intent: summarization
+   Reasoning: The user wants a condensed overview of a document's content, not a specific fact or computation.
+
+4. User Input: "asdkjhasd give me the thing"
+   Intent: unknown
+   Reasoning: The request is incoherent and does not clearly map to a document question, summary, or calculation.
 
 User Input: {user_input}
 
